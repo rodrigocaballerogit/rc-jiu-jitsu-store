@@ -1,33 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import Anthropic from '@anthropic-ai/sdk';
 import { ChatMessage, ChatTrigger } from '../types';
 
-// NOTE: VITE_ env vars are bundled client-side. For production, replace this
-// component's API calls with a Cloudflare Pages Function proxy to protect the key.
-const SYSTEM_PROMPT = `You are the official gear specialist for RC Jiu Jitsu, a premium combat sports brand. Help customers find the right gear.
-
-PRODUCT LINEUP:
-- RC Compression Rashguard ($45+): Competition-grade, 4-way stretch, moisture-wicking, anti-bacterial. Sizes XS–3XL.
-- RC MMA Fight Shorts ($55+): Lightweight, full range of motion, split waistband, hook & loop closure. Sizes XS–3XL.
-- RC Training Hoodie ($65+): 400gsm heavyweight fleece, kangaroo pocket, RC embroidered logo. Sizes S–3XL.
-- RC Classic Tee ($30+): 100% pre-shrunk cotton, unisex cut. Sizes S–3XL.
-
-SIZING GUIDANCE:
-- Rashguards: snug but not restrictive — size up if between sizes.
-- Shorts: true to size; size up if you prefer room to move while grappling.
-- Hoodies/Tees: standard sizing; size up for a relaxed fit.
-
-AVAILABILITY:
-- Made-to-order via Print on Demand (Printful integration coming soon).
-- Production: 3–5 business days. Shipping: 5–10 business days.
-- Ships to US and internationally.
-
-YOUR STYLE:
-- Direct and confident, like a coach giving gear advice.
-- Keep responses concise (2–3 sentences unless the user asks for detail).
-- When a user shows clear purchase intent, naturally ask: "What's your name and email? I can have someone follow up with pricing and availability."
-- Steer toward clicking "I'm Interested" on a product card for official lead capture.
-- Never be pushy — be genuinely helpful.`;
+// The Anthropic key lives ONLY on the server. This component talks to the
+// /api/chat Cloudflare Pages Function (see functions/api/chat.ts), which holds
+// the key and the system prompt. Nothing secret ships to the browser.
 
 interface ChatbotProps {
   trigger: ChatTrigger | null;
@@ -43,14 +19,6 @@ export default function Chatbot({ trigger }: ChatbotProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const prevTriggerIdRef = useRef<number | null>(null);
-
-  const clientRef = useRef<Anthropic | null>(null);
-  if (!clientRef.current && import.meta.env.VITE_ANTHROPIC_API_KEY) {
-    clientRef.current = new Anthropic({
-      apiKey: import.meta.env.VITE_ANTHROPIC_API_KEY,
-      dangerouslyAllowBrowser: true,
-    });
-  }
 
   // Open with a product-specific greeting when triggered from a product card
   useEffect(() => {
@@ -87,20 +55,6 @@ export default function Chatbot({ trigger }: ChatbotProps) {
       const messageText = text ?? input.trim();
       if (!messageText || isLoading) return;
 
-      if (!clientRef.current) {
-        setMessages((prev) => [
-          ...prev,
-          { role: 'user', content: messageText },
-          {
-            role: 'assistant',
-            content:
-              'API key not configured. Add VITE_ANTHROPIC_API_KEY to your .env file to enable the assistant.',
-          },
-        ]);
-        setInput('');
-        return;
-      }
-
       const userMessage: ChatMessage = { role: 'user', content: messageText };
       const updatedMessages = [...messages, userMessage];
       setMessages(updatedMessages);
@@ -109,23 +63,25 @@ export default function Chatbot({ trigger }: ChatbotProps) {
       setStreamingText('');
 
       try {
-        const stream = await clientRef.current.messages.create({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 512,
-          system: SYSTEM_PROMPT,
-          messages: updatedMessages,
-          stream: true,
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: updatedMessages }),
         });
 
+        if (!response.ok || !response.body) {
+          throw new Error(`Chat request failed: ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
         let fullContent = '';
-        for await (const event of stream) {
-          if (
-            event.type === 'content_block_delta' &&
-            event.delta.type === 'text_delta'
-          ) {
-            fullContent += event.delta.text;
-            setStreamingText(fullContent);
-          }
+
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          fullContent += decoder.decode(value, { stream: true });
+          setStreamingText(fullContent);
         }
 
         setMessages((prev) => [...prev, { role: 'assistant', content: fullContent }]);
